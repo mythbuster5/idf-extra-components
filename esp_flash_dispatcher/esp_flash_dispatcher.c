@@ -16,6 +16,8 @@
 #include "esp_flash_dispatcher.h"
 #include "spi_flash_mmap.h"
 #include "esp_private/spi_flash_os.h"
+#include "esp_memory_utils.h"
+#include "esp_cpu.h"
 
 static const char *TAG = "flash_dispatcher";
 
@@ -97,13 +99,23 @@ typedef struct {
 
 static flash_dispatcher_context_t s_flash_dispatcher_ctx;
 
+// The dispatcher only exists to move flash ops onto an internal RAM stack. A
+// caller already running on such a stack stays accessible while cache is off,
+// so dispatching would only add two context switches.
+static inline bool flash_dispatcher_stack_is_internal(void)
+{
+    return esp_ptr_internal(esp_cpu_get_sp());
+}
+
 // Bypass the dispatcher (call the real flash ops directly) when it cannot serve
 // the request: either the scheduler is gone (no-OS / panic handler), or the
 // scheduler hasn't started yet (early boot flash access such as partition
-// loading / core dump probing).
+// loading / core dump probing). Also bypass when dispatching brings no benefit.
 static inline bool flash_dispatcher_should_bypass(void)
 {
-    return flash_dispatcher_is_no_os() || xTaskGetSchedulerState() != taskSCHEDULER_RUNNING;
+    return flash_dispatcher_is_no_os()
+           || xTaskGetSchedulerState() != taskSCHEDULER_RUNNING
+           || flash_dispatcher_stack_is_internal();
 }
 
 static void flash_dispatcher_task(void *arg)
