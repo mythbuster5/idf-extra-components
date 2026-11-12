@@ -1,3 +1,9 @@
+## 1.0.3
+
+- fix: Fix a deadlock where a Flash write/erase blocked by a `SPI_FLASH_MMAP_FLAG_BLOCKS_WRITE` mapping held the dispatcher, so the `spi_flash_munmap` from another task could never run. Write/erase now waits for such mappings to be unmapped before entering the dispatcher.
+- feat: Added `spi_flash_mmap_pages` to the set of Flash APIs intercepted by the dispatcher.
+- fix: `spi_flash_munmap` wrapper now matches the `void` return type of the original API.
+
 ## 1.0.2
 
 - fix: Bypass the dispatcher and call the real Flash operations directly when it is not initialized yet, so early-boot Flash access (e.g. partition loading and core dump probing during system startup).

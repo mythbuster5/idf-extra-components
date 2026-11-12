@@ -5,9 +5,11 @@
  */
 #include <stdbool.h>
 #include <string.h>
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_flash_spi_init.h"
@@ -33,7 +35,12 @@ extern esp_err_t __real_esp_flash_erase_chip(esp_flash_t *chip);
 extern esp_err_t __real_esp_flash_write_encrypted(esp_flash_t *chip, uint32_t address, const void *buffer, uint32_t length);
 extern esp_err_t __real_spi_flash_mmap(size_t src_addr, size_t size, spi_flash_mmap_memory_t memory,
                                        const void **out_ptr, spi_flash_mmap_handle_t *out_handle);
-extern esp_err_t __real_spi_flash_munmap(spi_flash_mmap_handle_t handle);
+extern esp_err_t __real_spi_flash_mmap_pages(const int *pages, size_t page_count, spi_flash_mmap_memory_t memory,
+        const void **out_ptr, spi_flash_mmap_handle_t *out_handle);
+extern void __real_spi_flash_munmap(spi_flash_mmap_handle_t handle);
+
+#define FLASH_DISPATCHER_MMAP_BLOCKS_WRITE (1U << 1)
+#define FLASH_DISPATCHER_MMAP_IDLE_BIT      (1U << 0)
 
 // Operation type for flash requests
 typedef enum {
@@ -43,6 +50,7 @@ typedef enum {
     FLASH_OP_ERASE_REGION,
     FLASH_OP_ERASE_CHIP,
     FLASH_OP_MMAP,
+    FLASH_OP_MMAP_PAGES,
     FLASH_OP_MUNMAP,
 } flash_operation_t;
 
@@ -78,18 +86,32 @@ typedef struct {
             spi_flash_mmap_handle_t *out_handle;
         } mmap;                         // for FLASH_OP_MMAP
         struct {
+            const int *pages;
+            size_t page_count;
+            spi_flash_mmap_memory_t memory;
+            const void **out_ptr;
+            spi_flash_mmap_handle_t *out_handle;
+        } mmap_pages;                   // for FLASH_OP_MMAP_PAGES
+        struct {
             spi_flash_mmap_handle_t handle;
         } munmap;                       // for FLASH_OP_MUNMAP
     } args;
 } flash_operation_request_t;
+
+typedef struct flash_mmap_record {
+    spi_flash_mmap_handle_t handle;
+    struct flash_mmap_record *next;
+} flash_mmap_record_t;
 
 typedef struct {
     flash_operation_request_t request;  // request slot
     esp_err_t result;                   // result slot
     TaskHandle_t task;
     SemaphoreHandle_t dispatch_mutex;   // serialize concurrent callers
+    EventGroupHandle_t mmap_event;       // signal no blocking mmap
     SemaphoreHandle_t request_sem;      // binary semaphore
     SemaphoreHandle_t result_sem;       // binary semaphore
+    flash_mmap_record_t *blocking_mmaps;
     bool dispatcher_initialized;
 } flash_dispatcher_context_t;
 
@@ -104,6 +126,62 @@ static flash_dispatcher_context_t s_flash_dispatcher_ctx;
 static inline bool flash_dispatcher_should_bypass(void)
 {
     return flash_dispatcher_is_no_os() || xTaskGetSchedulerState() != taskSCHEDULER_RUNNING;
+}
+
+static bool flash_operation_writes(flash_operation_t op)
+{
+    return op == FLASH_OP_WRITE || op == FLASH_OP_WRITE_ENCRYPTED ||
+           op == FLASH_OP_ERASE_REGION || op == FLASH_OP_ERASE_CHIP;
+}
+
+static bool flash_operation_adds_blocking_mmap(const flash_operation_request_t *request)
+{
+#if CONFIG_IDF_TARGET_ESP32
+    (void)request;
+    return false;
+#else
+    if (request->op == FLASH_OP_MMAP) {
+        return ((uint32_t)request->args.mmap.memory & FLASH_DISPATCHER_MMAP_BLOCKS_WRITE) != 0;
+    }
+    if (request->op == FLASH_OP_MMAP_PAGES) {
+        return ((uint32_t)request->args.mmap_pages.memory & FLASH_DISPATCHER_MMAP_BLOCKS_WRITE) != 0;
+    }
+    return false;
+#endif
+}
+
+static spi_flash_mmap_handle_t *flash_operation_mmap_handle(const flash_operation_request_t *request)
+{
+    return request->op == FLASH_OP_MMAP ?
+           request->args.mmap.out_handle : request->args.mmap_pages.out_handle;
+}
+
+// Blocking mmap records are accessed with dispatch_mutex held.
+static void flash_dispatcher_add_mmap(flash_mmap_record_t *record)
+{
+    xEventGroupClearBits(s_flash_dispatcher_ctx.mmap_event, FLASH_DISPATCHER_MMAP_IDLE_BIT);
+    record->next = s_flash_dispatcher_ctx.blocking_mmaps;
+    s_flash_dispatcher_ctx.blocking_mmaps = record;
+}
+
+static void flash_dispatcher_remove_mmap(spi_flash_mmap_handle_t handle)
+{
+    flash_mmap_record_t *removed = NULL;
+
+    flash_mmap_record_t **record = &s_flash_dispatcher_ctx.blocking_mmaps;
+    while (*record != NULL) {
+        if ((*record)->handle == handle) {
+            removed = *record;
+            *record = removed->next;
+            break;
+        }
+        record = &(*record)->next;
+    }
+
+    if (s_flash_dispatcher_ctx.blocking_mmaps == NULL) {
+        xEventGroupSetBits(s_flash_dispatcher_ctx.mmap_event, FLASH_DISPATCHER_MMAP_IDLE_BIT);
+    }
+    heap_caps_free(removed);
 }
 
 static void flash_dispatcher_task(void *arg)
@@ -148,8 +226,16 @@ static void flash_dispatcher_task(void *arg)
                                            req->args.mmap.out_ptr,
                                            req->args.mmap.out_handle);
             break;
+        case FLASH_OP_MMAP_PAGES:
+            result = __real_spi_flash_mmap_pages(req->args.mmap_pages.pages,
+                                                 req->args.mmap_pages.page_count,
+                                                 req->args.mmap_pages.memory,
+                                                 req->args.mmap_pages.out_ptr,
+                                                 req->args.mmap_pages.out_handle);
+            break;
         case FLASH_OP_MUNMAP:
-            result = __real_spi_flash_munmap(req->args.munmap.handle);
+            __real_spi_flash_munmap(req->args.munmap.handle);
+            result = ESP_OK;
             break;
         default:
             ESP_EARLY_LOGE(TAG, "Unsupported flash operation type: %d", (int)req->op);
@@ -191,6 +277,19 @@ esp_err_t esp_flash_dispatcher_init(const esp_flash_dispatcher_config_t *cfg)
         return ESP_ERR_NO_MEM;
     }
 
+    s_flash_dispatcher_ctx.mmap_event = xEventGroupCreateWithCaps(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_flash_dispatcher_ctx.mmap_event == NULL) {
+        vSemaphoreDeleteWithCaps(s_flash_dispatcher_ctx.dispatch_mutex);
+        s_flash_dispatcher_ctx.dispatch_mutex = NULL;
+        vSemaphoreDeleteWithCaps(s_flash_dispatcher_ctx.request_sem);
+        s_flash_dispatcher_ctx.request_sem = NULL;
+        vSemaphoreDeleteWithCaps(s_flash_dispatcher_ctx.result_sem);
+        s_flash_dispatcher_ctx.result_sem = NULL;
+        ESP_EARLY_LOGE(TAG, "create mmap event failed");
+        return ESP_ERR_NO_MEM;
+    }
+    xEventGroupSetBits(s_flash_dispatcher_ctx.mmap_event, FLASH_DISPATCHER_MMAP_IDLE_BIT);
+
     BaseType_t rc = xTaskCreatePinnedToCoreWithCaps(flash_dispatcher_task,
                     "flash_dispatcher",
                     cfg->task_stack_size,
@@ -207,6 +306,8 @@ esp_err_t esp_flash_dispatcher_init(const esp_flash_dispatcher_config_t *cfg)
         s_flash_dispatcher_ctx.request_sem = NULL;
         vSemaphoreDeleteWithCaps(s_flash_dispatcher_ctx.result_sem);
         s_flash_dispatcher_ctx.result_sem = NULL;
+        vEventGroupDeleteWithCaps(s_flash_dispatcher_ctx.mmap_event);
+        s_flash_dispatcher_ctx.mmap_event = NULL;
         ESP_EARLY_LOGE(TAG, "create flash dispatcher task failed");
         return ESP_ERR_INVALID_STATE;
     }
@@ -225,7 +326,21 @@ static esp_err_t flash_dispatcher_execute(const flash_operation_request_t *reque
 {
     ESP_RETURN_ON_FALSE(s_flash_dispatcher_ctx.dispatcher_initialized, ESP_ERR_INVALID_STATE, TAG, "flash dispatcher is not initialized");
 
-    xSemaphoreTake(s_flash_dispatcher_ctx.dispatch_mutex, portMAX_DELAY);
+    flash_mmap_record_t *new_mmap = NULL;
+    if (flash_operation_adds_blocking_mmap(request)) {
+        new_mmap = heap_caps_malloc(sizeof(flash_mmap_record_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_RETURN_ON_FALSE(new_mmap, ESP_ERR_NO_MEM, TAG, "allocate mmap record failed");
+    }
+
+    while (true) {
+        xSemaphoreTake(s_flash_dispatcher_ctx.dispatch_mutex, portMAX_DELAY);
+        if (!flash_operation_writes(request->op) || s_flash_dispatcher_ctx.blocking_mmaps == NULL) {
+            break;
+        }
+        xSemaphoreGive(s_flash_dispatcher_ctx.dispatch_mutex);
+        xEventGroupWaitBits(s_flash_dispatcher_ctx.mmap_event,
+                            FLASH_DISPATCHER_MMAP_IDLE_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    }
 
     // Publish the request into the shared slot and wake the worker.
     s_flash_dispatcher_ctx.request = *request;
@@ -233,12 +348,22 @@ static esp_err_t flash_dispatcher_execute(const flash_operation_request_t *reque
 
     if (xSemaphoreTake(s_flash_dispatcher_ctx.result_sem, portMAX_DELAY) != pdTRUE) {
         xSemaphoreGive(s_flash_dispatcher_ctx.dispatch_mutex);
+        heap_caps_free(new_mmap);
         ESP_EARLY_LOGE(TAG, "Failed to receive %s result from queue", op_name ? op_name : "flash");
         return ESP_ERR_TIMEOUT;
     }
     esp_err_t operation_result = s_flash_dispatcher_ctx.result;
 
+    if (operation_result == ESP_OK && new_mmap != NULL) {
+        new_mmap->handle = *flash_operation_mmap_handle(request);
+        flash_dispatcher_add_mmap(new_mmap);
+        new_mmap = NULL;
+    } else if (operation_result == ESP_OK && request->op == FLASH_OP_MUNMAP) {
+        flash_dispatcher_remove_mmap(request->args.munmap.handle);
+    }
+
     xSemaphoreGive(s_flash_dispatcher_ctx.dispatch_mutex);
+    heap_caps_free(new_mmap);
     return operation_result;
 }
 
@@ -341,10 +466,31 @@ esp_err_t __wrap_spi_flash_mmap(size_t src_addr, size_t size, spi_flash_mmap_mem
     return flash_dispatcher_execute(&request, "spi_flash_mmap");
 }
 
-esp_err_t __wrap_spi_flash_munmap(spi_flash_mmap_handle_t handle)
+esp_err_t __wrap_spi_flash_mmap_pages(const int *pages, size_t page_count, spi_flash_mmap_memory_t memory,
+                                      const void **out_ptr, spi_flash_mmap_handle_t *out_handle)
 {
     if (flash_dispatcher_should_bypass()) {
-        return __real_spi_flash_munmap(handle);
+        return __real_spi_flash_mmap_pages(pages, page_count, memory, out_ptr, out_handle);
+    }
+    flash_operation_request_t request = {
+        .chip = NULL,
+        .op = FLASH_OP_MMAP_PAGES,
+        .args.mmap_pages = {
+            .pages = pages,
+            .page_count = page_count,
+            .memory = memory,
+            .out_ptr = out_ptr,
+            .out_handle = out_handle,
+        },
+    };
+    return flash_dispatcher_execute(&request, "spi_flash_mmap_pages");
+}
+
+void __wrap_spi_flash_munmap(spi_flash_mmap_handle_t handle)
+{
+    if (flash_dispatcher_should_bypass()) {
+        __real_spi_flash_munmap(handle);
+        return;
     }
     flash_operation_request_t request = {
         .chip = NULL,
@@ -353,5 +499,5 @@ esp_err_t __wrap_spi_flash_munmap(spi_flash_mmap_handle_t handle)
             .handle = handle,
         },
     };
-    return flash_dispatcher_execute(&request, "spi_flash_munmap");
+    (void)flash_dispatcher_execute(&request, "spi_flash_munmap");
 }
